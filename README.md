@@ -1,2 +1,2 @@
-# me-board
+# meBoard
 treehacks 2026
