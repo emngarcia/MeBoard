@@ -15,3 +15,12 @@ Pods/
 
 # Carthage (if used)
 Carthage/Build/
+
+# Ignore large dataset
+data_preprocessing/data/Original Reddit Data/merged_all_data.csv
+
+# Python venv
+venv/
+.venv/
+__pycache__/
+*.pyc
