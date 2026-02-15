@@ -1,6 +1,7 @@
 import os
 import time
-from typing import List, Tuple
+from datetime import datetime, timezone
+from typing import Tuple
 
 from dotenv import load_dotenv
 from supabase import create_client
@@ -14,15 +15,14 @@ load_dotenv()
 # Env / config
 # -----------------------
 SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]  # server-side only
+SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-# If your model is private, HF_TOKEN must be set OR you must `huggingface-cli login`.
 HF_MODEL = os.getenv("HF_MODEL", "emngarcia/deberta_mh_benign_worrisome")
-
 MODEL_VERSION = os.getenv("MODEL_VERSION", "hackathon-v1")
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "5"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1.0"))
 MAX_LEN = int(os.getenv("MAX_LEN", "256"))
+MIN_WORDS = int(os.getenv("MIN_WORDS", "5"))
 
 # -----------------------
 # Clients
@@ -30,86 +30,110 @@ MAX_LEN = int(os.getenv("MAX_LEN", "256"))
 sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # -----------------------
-# Load model locally (once)
+# Load model (once)
 # -----------------------
-# Force slow tokenizer to avoid the fast-tokenizer crash you saw.
+print(f"Loading model {HF_MODEL}...")
 tokenizer = AutoTokenizer.from_pretrained(HF_MODEL, use_fast=False)
 model = AutoModelForSequenceClassification.from_pretrained(HF_MODEL)
 model.eval()
-
-# Optional: put model on GPU if available (not typical on Mac)
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 model.to(device)
+print(f"Model loaded on {device}")
 
-def infer_batch(texts: List[str]) -> List[Tuple[float, str]]:
-    """
-    Returns list of (score, label) for each text.
-    score = max softmax prob, label = argmax id2label
-    """
+
+# -----------------------
+# Inference
+# -----------------------
+def infer_one(text: str) -> Tuple[float, str]:
     enc = tokenizer(
-        texts,
+        [text],
         truncation=True,
         max_length=MAX_LEN,
         padding=True,
         return_tensors="pt",
     )
     enc = {k: v.to(device) for k, v in enc.items()}
-
     with torch.no_grad():
         logits = model(**enc).logits
         probs = torch.softmax(logits, dim=-1)
+    score, idx = torch.max(probs[0], dim=-1)
+    label = model.config.id2label.get(int(idx.item()), str(int(idx.item())))
+    return float(score.item()), label
 
-    scores, ids = torch.max(probs, dim=-1)
 
-    out: List[Tuple[float, str]] = []
-    for s, i in zip(scores.tolist(), ids.tolist()):
-        label = model.config.id2label.get(int(i), str(int(i)))
-        out.append((float(s), label))
-    return out
+# -----------------------
+# DB helpers
+# -----------------------
+def claim_events(batch_size: int):
+    """Atomically claim a batch of queued events and mark them processing."""
+    res = sb.rpc("claim_keyboard_events", {"batch_size": batch_size}).execute()
+    return res.data or []
 
-def mark_failed(event_id: str, err: Exception) -> None:
-    # You can also store err text if you added an `error` column.
-    sb.table("keyboard_events").update({"status": "failed"}).eq("id", event_id).execute()
-    print("FAILED", event_id, err)
+
+def word_count(text: str) -> int:
+    t = (text or "").strip()
+    if not t:
+        return 0
+    return len(t.split())
+
 
 def main() -> None:
-    print(f"Worker started. Model={HF_MODEL} device={device} batch={BATCH_SIZE}")
+    print(
+        f"Worker started. model={HF_MODEL} device={device} "
+        f"batch={BATCH_SIZE} min_words={MIN_WORDS}"
+    )
 
     while True:
-        claimed = sb.rpc("claim_keyboard_events", {"batch_size": BATCH_SIZE}).execute().data or []
-        if not claimed:
+        events = claim_events(BATCH_SIZE)
+
+        if not events:
             time.sleep(SLEEP_SECONDS)
             continue
 
-        # batch inference
-        event_ids = [row["id"] for row in claimed]
-        texts = [row["text"] for row in claimed]
+        print(f"Claimed {len(events)} events")
 
-        try:
-            preds = infer_batch(texts)
-        except Exception as e:
-            # If model inference fails, mark all claimed as failed
-            for eid in event_ids:
-                mark_failed(eid, e)
-            continue
+        for ev in events:
+            event_id = ev["id"]
+            text = (ev.get("text") or "").strip()
 
-        # write results row-by-row (simple + reliable for hackathon)
-        for eid, (score, label) in zip(event_ids, preds):
+            # Discard if too few words
+            if word_count(text) < MIN_WORDS:
+                sb.table("keyboard_events") \
+                    .update({"status": "discarded"}) \
+                    .eq("id", event_id) \
+                    .execute()
+                print(f"Discarded {event_id}: '{text[:40]}'")
+                continue
+
+            # Run inference
             try:
-                sb.table("predictions").upsert(
-                    {
-                        "event_id": eid,
-                        "label": label,
-                        "score": score,
-                        "model_version": MODEL_VERSION,
-                    },
-                    on_conflict="event_id",
-                ).execute()
+                score, label = infer_one(text)
+                print(f"  {event_id}: label={label} score={score:.3f} text='{text[:60]}'")
 
-                sb.table("keyboard_events").update({"status": "done"}).eq("id", eid).execute()
+                # Write to predictions
+                sb.table("predictions").insert({
+                    "event_id": event_id,
+                    "label": label,
+                    "score": score,
+                    "model_version": MODEL_VERSION,
+                    "input_text": text,
+                }).execute()
+
+                # Mark event done
+                sb.table("keyboard_events") \
+                    .update({"status": "done"}) \
+                    .eq("id", event_id) \
+                    .execute()
 
             except Exception as e:
-                mark_failed(eid, e)
+                print(f"  FAILED {event_id}: {e}")
+                sb.table("keyboard_events") \
+                    .update({"status": "failed", "error": str(e)[:5000]}) \
+                    .eq("id", event_id) \
+                    .execute()
+
+        time.sleep(0.2)
+
 
 if __name__ == "__main__":
     main()
